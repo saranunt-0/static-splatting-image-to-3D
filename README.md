@@ -1,0 +1,1 @@
+# static-splatting-image-to-3D
