@@ -37,13 +37,13 @@ def test_look_at_identity():
 def test_edges_follow_parallax_physics():
     d = _step_depth()
     b = 0.1
-    e = occlusion_edges(d, K[0, 0], b, parallax_px=1.0, min_ratio=0.03)
+    e = occlusion_edges(d, K[0, 0], b, parallax_px=1.0)
     assert e.fg[24:48, 30].all() and e.bg[24:48, 29].all()        # left side of the box
     assert not e.fg[:20].any() and not e.bg[:20].any()            # flat wall: no edges
     expected = K[0, 0] * b * (1 / 1.0 - 1 / 3.0)
     assert np.isclose(e.gap[30, 30], expected, rtol=1e-5)
     # The same jump is ignored when the expected camera motion cannot reveal a full pixel.
-    e_small = occlusion_edges(d, K[0, 0], 1.0 / (K[0, 0] * 2), parallax_px=1.0, min_ratio=0.03)
+    e_small = occlusion_edges(d, K[0, 0], 1.0 / (K[0, 0] * 2), parallax_px=1.0)
     assert not e_small.fg.any()
 
 
@@ -52,14 +52,26 @@ def test_steep_smooth_floor_is_not_an_edge():
     v = np.arange(H)[:, None] + 0.5 - K[1, 2]
     d = np.where(v > 0.5, K[1, 1] * 1.5 / np.maximum(v, 0.5), 50.0).repeat(W, 1).astype(np.float32)
     d = np.minimum(d, 50.0)
-    e = occlusion_edges(d, K[0, 0], 0.2, 1.0, 0.03)
+    e = occlusion_edges(d, K[0, 0], 0.2, 1.0)
     assert not e.fg[H // 2 + 3:].any()
+
+
+def test_near_steep_surface_stays_closed_but_steps_are_cut():
+    # Plane seen at 80 deg from its normal, close to the camera: big per-pixel parallax,
+    # yet continuous. A real step of the same parallax is cut.
+    t = np.tan(np.radians(80.0))  # relative depth step per pixel = tan(theta) / f
+    z = 0.5 * np.exp(np.arange(W) * t / K[0, 0])[None, :].repeat(H, 0).astype(np.float32)
+    e = occlusion_edges(z, K[0, 0], 0.5, 1.0)
+    assert not e.fg.any()
+    step = np.full((H, W), 2.0, np.float32)
+    step[:, : W // 2] = 0.5
+    assert occlusion_edges(step, K[0, 0], 0.5, 1.0).fg[:, W // 2 - 1].all()
 
 
 def test_sharpen_removes_flying_pixels():
     d = _step_depth()
     d[24:48, 29] = 2.0  # blurred edge column halfway between box and wall
-    s = sharpen_depth_edges(d, K[0, 0], 0.1, 1.0, 0.03)
+    s = sharpen_depth_edges(d, K[0, 0], 0.1, 1.0, 88.0)
     assert set(np.unique(np.round(s[30:40, 27:33], 3))) <= {1.0, 3.0}
 
 
@@ -70,7 +82,7 @@ def _render(gs, V=np.eye(4)):
 def test_lift_reproduces_input_view_without_holes():
     rgb = _texture().astype(np.float32)
     d = _step_depth()
-    e = occlusion_edges(d, K[0, 0], 0.1, 1.0, 0.03)
+    e = occlusion_edges(d, K[0, 0], 0.1, 1.0)
     gs = lift_surface(rgb, d, K, e, LiftConfig())
     out = _render(gs)
     assert out["alpha"].min() > 0.97
@@ -84,7 +96,7 @@ def test_tilted_plane_stays_closed_from_new_viewpoint():
     u = np.arange(W)[None, :] + 0.5 - K[0, 2]
     x_over_z = u / K[0, 0]
     d = (1.0 / (0.6 - 0.5 * x_over_z)).repeat(H, 0).astype(np.float32)  # plane z = 1/(a - b x/z)
-    e = occlusion_edges(d, K[0, 0], 0.1, 1.0, 0.03)
+    e = occlusion_edges(d, K[0, 0], 0.1, 1.0)
     gs = lift_surface(_texture().astype(np.float32), d, K, e, LiftConfig())
     out = _render(gs, translation_view([0.08, 0.0, 0.1]))
     inner = out["alpha"][8:-8, 8:-8]

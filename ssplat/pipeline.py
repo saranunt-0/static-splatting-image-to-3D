@@ -52,8 +52,8 @@ def reconstruct(img: np.ndarray, depth: np.ndarray, K: np.ndarray, cfg: Pipeline
     oc = cfg.occlusion
     b = oc.max_baseline * median
     if cfg.lift.sharpen_edges:
-        depth = sharpen_depth_edges(depth, K[0, 0], b, oc.edge_parallax_px, oc.edge_min_ratio)
-    edges = occlusion_edges(depth, K[0, 0], b, oc.edge_parallax_px, oc.edge_min_ratio)
+        depth = sharpen_depth_edges(depth, K[0, 0], b, oc.edge_parallax_px, oc.edge_max_angle_deg)
+    edges = occlusion_edges(depth, K[0, 0], b, oc.edge_parallax_px, oc.edge_max_angle_deg)
     img_f = img.astype(np.float32) / 255.0
     sets = [lift_surface(img_f, depth, K, edges, cfg.lift)]
     hidden = None
@@ -65,7 +65,7 @@ def reconstruct(img: np.ndarray, depth: np.ndarray, K: np.ndarray, cfg: Pipeline
             inpainter = make_inpainter(oc.inpainter, oc.lama_checkpoint, cfg.optim.device)
         hidden = build_hidden_layer(img, depth, K, sky, oc, inpainter, median)
         sets.append(lift_layer(hidden.rgb.astype(np.float32) / 255.0, hidden.depth, hidden.K, hidden.mask,
-                               cfg.lift, b, oc.edge_parallax_px, oc.edge_min_ratio, layer=1))
+                               cfg.lift, b, oc.edge_parallax_px, oc.edge_max_angle_deg, layer=1))
         info["hidden_layer"] = hidden.stats()
     gs = GaussianSet.concat(*sets)
     if cfg.optim.steps > 0:

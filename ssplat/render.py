@@ -15,10 +15,15 @@ from .rasterize import Camera, rasterize
 
 
 class Renderer:
-    def __init__(self, gs: GaussianSet, device: torch.device):
+    """Novel-view renderer. `near` culls Gaussians closer than this to the camera (world units):
+    in dolly shots, surfaces passing right by the lens would otherwise cover the whole frame
+    with a handful of huge splats (and cost a lot of memory)."""
+
+    def __init__(self, gs: GaussianSet, device: torch.device, near: float = 1e-3):
         t = gs.to_torch(device)
         self.t = t
         self.device = device
+        self.near = near
 
     @torch.no_grad()
     def __call__(self, viewmat: np.ndarray, K: np.ndarray, width: int, height: int,
@@ -27,7 +32,7 @@ class Renderer:
                      width, height).to(self.device)
         t = self.t
         out = rasterize(t["means"], t["quats"], t["scales"], t["opacities"], t["colors"].clamp_min(0), cam,
-                        background=torch.tensor(background, device=self.device))
+                        background=torch.tensor(background, device=self.device), near=self.near)
         a = out["alpha"]
         return {"rgb": out["rgb"].clamp(0, 1).cpu().numpy(), "alpha": a.cpu().numpy(),
                 "depth": (out["depth"] / a.clamp_min(1e-6)).cpu().numpy()}
@@ -42,7 +47,7 @@ def write_video(frames: List[np.ndarray], path: Path, fps: int) -> Path:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with imageio.get_writer(str(path), fps=fps, codec="libx264", quality=8, macro_block_size=2,
-                            ffmpeg_params=["-pix_fmt", "yuv420p"]) as w:
+                            pixelformat="yuv420p") as w:
         for f in frames:
             h, wd = f.shape[:2]
             w.append_data(f[: h - h % 2, : wd - wd % 2])
@@ -52,7 +57,7 @@ def write_video(frames: List[np.ndarray], path: Path, fps: int) -> Path:
 def render_videos(gs: GaussianSet, K: np.ndarray, width: int, height: int, median_depth: float,
                   cfg: RenderConfig, out_dir: Path, device: torch.device, name: str = "scene",
                   log=print) -> Dict[str, str]:
-    r = Renderer(gs, device)
+    r = Renderer(gs, device, near=0.05 * median_depth)
     Ks = K.copy()
     Ks[:2] *= cfg.scale
     w, h = int(round(width * cfg.scale)), int(round(height * cfg.scale))
@@ -73,7 +78,7 @@ def preview_grid(gs: GaussianSet, K: np.ndarray, width: int, height: int, median
 
     from .camera import look_at
 
-    r = Renderer(gs, device)
+    r = Renderer(gs, device, near=0.05 * median_depth)
     b = motion * median_depth
     target = np.array([0.0, 0.0, median_depth])
     tiles = []

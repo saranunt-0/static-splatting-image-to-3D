@@ -35,10 +35,10 @@ def lift_surface(rgb: np.ndarray, depth: np.ndarray, K: np.ndarray, edges: Edges
 
 
 def lift_layer(rgb: np.ndarray, depth: np.ndarray, K: np.ndarray, mask: np.ndarray, cfg: LiftConfig,
-               baseline: float, parallax_px: float, min_ratio: float, layer: int = 1) -> GaussianSet:
+               baseline: float, parallax_px: float, max_angle_deg: float, layer: int = 1) -> GaussianSet:
     """Lift a partial layer (pixels in `mask`); neighbours outside the mask are never joined."""
     d = np.where(mask, depth, np.nanmax(np.where(mask, depth, np.nan)) if mask.any() else 1.0)
-    e = occlusion_edges(d, K[0, 0], baseline, parallax_px, min_ratio)
+    e = occlusion_edges(d, K[0, 0], baseline, parallax_px, max_angle_deg)
     cut_x = e.cut_x | ~(mask[:, :-1] & mask[:, 1:])
     cut_y = e.cut_y | ~(mask[:-1, :] & mask[1:, :])
     return lift(rgb, d, K, cut_x, cut_y, cfg, mask=mask, layer=layer)

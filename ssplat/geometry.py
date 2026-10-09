@@ -23,7 +23,7 @@ def unproject(depth: np.ndarray, K: np.ndarray, offset=(0.0, 0.0)) -> np.ndarray
 
 
 def sharpen_depth_edges(depth: np.ndarray, f: float, baseline: float, parallax_px: float,
-                        min_ratio: float, iters: int = 3) -> np.ndarray:
+                        max_angle_deg: float, iters: int = 3) -> np.ndarray:
     """Remove "flying pixels": snap depths in discontinuity zones to the nearer side.
 
     Monocular depth networks blur depth edges over a few pixels; lifted to 3D
@@ -33,10 +33,12 @@ def sharpen_depth_edges(depth: np.ndarray, f: float, baseline: float, parallax_p
     disparity is then replaced by the closer of the local minimum or maximum.
     """
     disp = 1.0 / depth
+    # A 3x3 window spans up to ~3 pixel steps of a continuous surface, hence 3 * tan.
+    steep = 3.0 * np.tan(np.radians(max_angle_deg))
     for _ in range(iters):
         lo = ndimage.minimum_filter(disp, size=3, mode="nearest")
         hi = ndimage.maximum_filter(disp, size=3, mode="nearest")
-        zone = (f * baseline * (hi - lo) >= parallax_px) & (hi >= lo * (1 + min_ratio))
+        zone = (f * baseline * (hi - lo) >= parallax_px) & (f * (hi - lo) >= steep * lo)
         # Near/far decision on the locally averaged disparity: spatially coherent, unlike a
         # per-pixel decision, which gives a dithered, salt-and-pepper edge.
         near = ndimage.uniform_filter(disp, size=3, mode="nearest") > 0.5 * (lo + hi)
@@ -62,13 +64,18 @@ class Edges:
 
 
 def occlusion_edges(depth: np.ndarray, f: float, baseline: float, parallax_px: float,
-                    min_ratio: float) -> Edges:
+                    max_angle_deg: float = 88.0) -> Edges:
     """Depth discontinuities that would open a visible gap for camera motion <= baseline.
 
-    The test is physical: moving the camera sideways by b shifts two points at
-    disparities d1 > d2 apart by f * b * (d1 - d2) pixels. Smooth but steep
-    surfaces (a corridor floor near the vanishing point) have small per-pixel
-    disparity steps and are not cut; real depth jumps (door frames) are.
+    Two physical tests, both required for a cut between neighbouring pixels:
+    * visibility: moving the camera sideways by b shifts two points at disparities
+      d1 > d2 apart by f * b * (d1 - d2) pixels; below `parallax_px` nobody can see it
+      (e.g. a corridor floor near the vanishing point: tiny per-pixel steps);
+    * steepness: a continuous surface seen at angle theta from its normal has a
+      relative depth step of tan(theta) / f per pixel, i.e. f * (d1 - d2) / d2 = tan(theta).
+      Anything steeper than `max_angle_deg` is treated as a jump, not a surface. This keeps
+      near, steep but continuous surfaces (a shelf top seen almost edge-on) closed, and is
+      independent of the image resolution.
     """
     disp = 1.0 / depth
     H, W = depth.shape
@@ -76,10 +83,12 @@ def occlusion_edges(depth: np.ndarray, f: float, baseline: float, parallax_px: f
     bg = np.zeros((H, W), bool)
     gap = np.zeros((H, W), np.float32)
 
+    steep = np.tan(np.radians(max_angle_deg))
+
     def pair(a, b):
         hi, lo = np.maximum(a, b), np.minimum(a, b)
         par = f * baseline * (hi - lo)
-        return (par >= parallax_px) & (hi >= lo * (1 + min_ratio)), par
+        return (par >= parallax_px) & (f * (hi - lo) >= steep * lo), par
 
     cut_x, par_x = pair(disp[:, :-1], disp[:, 1:])
     cut_y, par_y = pair(disp[:-1, :], disp[1:, :])

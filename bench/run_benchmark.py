@@ -10,8 +10,9 @@ Compares, from ONE reference image:
 for two depth sources: ground-truth depth (isolates the 3DGS part) and Depth Anything V2
 (relative depth; median-aligned to the ground truth because it has no metric scale).
 
-Metrics on each novel view: PSNR / SSIM over the whole image, PSNR on pixels that are
-NOT visible in the reference photo (disoccluded + out of frame), and coverage (alpha > 0.5).
+Metrics on each novel view: PSNR / SSIM over the whole image, PSNR on pixels that ARE / are
+NOT visible in the reference photo (seen / unseen = disoccluded + out of frame), and coverage
+(alpha > 0.5). Each variant's Gaussians are saved (gs_*.npz) so `--eval-only` can re-score them.
 
     python -m bench.run_benchmark --out work/bench [--depth gt,dav2] [--steps 200]
 """
@@ -30,6 +31,7 @@ from bench.synthetic_corridor import default_camera, render, visible_from_refere
 from ssplat.camera import look_at, translation_view
 from ssplat.config import PipelineConfig
 from ssplat.depth import _device
+from ssplat.gaussians import GaussianSet
 from ssplat.inpaint import make_inpainter
 from ssplat.metrics import psnr, ssim
 from ssplat.pipeline import naive_points, reconstruct
@@ -95,6 +97,7 @@ def evaluate(gs, K, W, H, views, dev) -> dict:
         hidden = torch.from_numpy(~v["vis"])
         res[name] = {
             "psnr": psnr(pred, gt), "ssim": ssim(pred, gt),
+            "psnr_seen": psnr(pred, gt, ~hidden),
             "psnr_unseen": psnr(pred, gt, hidden) if hidden.any() else float("nan"),
             "unseen_frac": float(hidden.float().mean()),
             "coverage": float((o["alpha"] > 0.5).mean()),
@@ -111,15 +114,19 @@ def main():
     ap.add_argument("--methods", default="points,surfels,surfels+opt,surfels+hid,full")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--inpainter", default="lama")
+    ap.add_argument("--eval-only", action="store_true", help="Re-score saved gs_*.npz instead of reconstructing")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     W, H = (int(v) for v in args.size.split("x"))
     dev = _device("auto")
     K, ref, ref_depth, views = ground_truth(args.out, W, H)
     ref_u8 = to_uint8(ref)
-    inpainter = make_inpainter(args.inpainter)
+    inpainter = None if args.eval_only else make_inpainter(args.inpainter)
     results = {"views": {k: {"unseen_frac": float((~v["vis"]).mean())} for k, v in views.items()}}
     strips = {}
+    prev = {}
+    if args.eval_only and (args.out / "results.json").exists():
+        prev = json.loads((args.out / "results.json").read_text())
     for dsrc in args.depth.split(","):
         depth = ref_depth.astype(np.float32) if dsrc == "gt" else dav2_depth(ref_u8, ref_depth, args.out)
         results.setdefault("depth_error", {})[dsrc] = depth_errors(depth, ref_depth)
@@ -129,7 +136,11 @@ def main():
             cfg.optim.steps = args.steps if method in ("surfels+opt", "full") else 0
             cfg.occlusion.enabled = method in ("surfels+hid", "full")
             cfg.occlusion.inpainter = args.inpainter
-            if method == "points":
+            saved = args.out / f"gs_{dsrc}_{method.replace('+', '_')}.npz"
+            if args.eval_only and saved.exists():
+                gs = GaussianSet(**dict(np.load(saved)))
+                info = {}
+            elif method == "points":
                 gs = naive_points(ref_u8.astype(np.float32) / 255.0, depth, K)
                 info = {}
             else:
@@ -139,10 +150,15 @@ def main():
             key = f"{dsrc}/{method}"
             imgs = {n: ev[n].pop("_img") for n in ev}
             strips[key] = {n: imgs[n] for n in ("x+0.3", "orbit-0.25", "z+1.0")}
-            mean = {m: float(np.nanmean([ev[n][m] for n in ev])) for m in ("psnr", "ssim", "psnr_unseen", "coverage")}
+            np.savez_compressed(args.out / f"gs_{dsrc}_{method.replace('+', '_')}.npz",
+                                **{f: getattr(gs, f) for f in ("means", "quats", "scales", "opacities", "colors", "layer")})
+            mean = {m: float(np.nanmean([ev[n][m] for n in ev]))
+                    for m in ("psnr", "ssim", "psnr_seen", "psnr_unseen", "coverage")}
+            if args.eval_only:
+                info = {"optim": prev.get(key, {}).get("optim")}
             results[key] = {"mean": mean, "per_view": ev, "seconds": round(time.time() - t, 1),
                             "optim": info.get("optim"), "num_gaussians": len(gs)}
-            print(f"[bench] {key:22s} PSNR {mean['psnr']:.2f}  SSIM {mean['ssim']:.4f}  "
+            print(f"[bench] {key:22s} PSNR {mean['psnr']:.2f}  SSIM {mean['ssim']:.4f}  seen {mean['psnr_seen']:.2f}  "
                   f"PSNR(unseen) {mean['psnr_unseen']:.2f}  coverage {mean['coverage']:.4f}  "
                   f"({time.time() - t:.0f}s)", flush=True)
             (args.out / "results.json").write_text(json.dumps(results, indent=2))

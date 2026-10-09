@@ -144,8 +144,8 @@ def _dav2(image: np.ndarray, cfg: DepthConfig, fov: float) -> DepthResult:
     _log(f"Depth Anything V2 ({path.name}) at {w}x{h}")
     disp = sess.run(None, {sess.get_inputs()[0].name: x.transpose(2, 0, 1)[None]})[0][0]
     disp = cv2.resize(disp.astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
-    disp = disp - cfg.dav2_disparity_shift * float(disp.max())
-    valid = disp > 1e-3 * float(disp.max())
+    valid = disp > 1e-3 * float(disp.max())  # before the offset: true "nothing there" (sky)
+    disp = disp + cfg.dav2_disparity_offset * float(disp.max())
     depth = np.where(valid, 1.0 / np.maximum(disp, 1e-12), 0.0)
     depth *= cfg.median_depth / float(np.median(depth[valid]))
     depth, sky = _finalize(depth, valid, cfg)

@@ -54,7 +54,7 @@ class HiddenLayer:
         h, w = H - 2 * self.pad[1], W - 2 * self.pad[0]
         return {"hidden_band_px": int(self.band.sum()), "border_px": int(self.border.sum()),
                 "band_fraction_of_image": round(float(self.band.sum()) / (h * w), 4),
-                "pad_xy": list(self.pad), "edge_px": int(self.edges.fg.sum())}
+                "pad_xy": list(self.pad), "edge_px": int(self.edges.fg.sum())}  # before fragment filter
 
 
 def _masked_smooth(values: np.ndarray, mask: np.ndarray, size: int = 5) -> np.ndarray:
@@ -74,21 +74,26 @@ def build_hidden_layer(image: np.ndarray, depth: np.ndarray, K: np.ndarray, sky:
     f = float(K[0, 0])
     b = cfg.max_baseline * median_depth
     disp = 1.0 / depth.astype(np.float64)
-    E = occlusion_edges(depth, f, b, cfg.edge_parallax_px, cfg.edge_min_ratio)
+    E = occlusion_edges(depth, f, b, cfg.edge_parallax_px, cfg.edge_max_angle_deg)
     max_extent = max(4, int(cfg.max_extent_frac * W))
 
     # ---- 1. strip behind foreground edges ---------------------------------------------
-    radius = np.where(E.fg, np.minimum(np.ceil(E.gap) + cfg.band_margin_px, max_extent), 0.0)
-    if E.fg.any():
-        dist_fg, (iy, ix) = ndimage.distance_transform_edt(~E.fg, return_indices=True)
+    fg_edges = E.fg
+    if cfg.min_edge_px > 1 and fg_edges.any():
+        lab, n = ndimage.label(fg_edges, structure=np.ones((3, 3)))
+        sizes = ndimage.sum(fg_edges, lab, index=np.arange(1, n + 1))
+        fg_edges = np.isin(lab, 1 + np.nonzero(sizes >= cfg.min_edge_px)[0])
+    radius = np.where(fg_edges, np.minimum(np.ceil(E.gap) + cfg.band_margin_px, max_extent), 0.0)
+    if fg_edges.any():
+        dist_fg, (iy, ix) = ndimage.distance_transform_edt(~fg_edges, return_indices=True)
         r_near = radius[iy, ix]
         _, (by, bx) = ndimage.distance_transform_edt(~E.bg, return_indices=True)
         d_bg = disp[by, bx]
         front = disp > d_bg * (1 + cfg.edge_min_ratio)      # in front of the nearby background
         # Foreground around edges. It is also masked for the inpainter so that it copies
-        # background (not foreground) texture into the strip; kept tight because large
-        # holes make inpainting blurrier.
-        fg_near = front & (dist_fg <= 1.5 * r_near + 2) & ~sky
+        # background (not foreground) texture into the strip ("ghosting" otherwise); not
+        # wider, because large holes make inpainting blurrier.
+        fg_near = front & (dist_fg <= 2 * r_near + 2) & ~sky
         band = fg_near & (dist_fg <= r_near)
     else:
         front = np.zeros((H, W), bool)
@@ -134,12 +139,17 @@ def build_hidden_layer(image: np.ndarray, depth: np.ndarray, K: np.ndarray, sky:
     trusted_c = to_canvas(trusted, False)
     # The strip behind an edge continues the surface on the far side of that edge, so its
     # sources exclude everything that is in front of nearby background (incl. the occluder).
-    band_src = trusted_c & ~to_canvas(front, False)
+    # Far / sky pixels are valid background too (constant depth: zero slope).
+    sky_c = to_canvas(sky, False)
+    gx_c[sky_c] = 0.0
+    gy_c[sky_c] = 0.0
+    sources = trusted_c | sky_c
+    band_src = sources & ~to_canvas(front, False)
     if not band_src.any():
-        band_src = trusted_c
+        band_src = sources
     ext_b, src_b = nearest_extrapolate(disp_c, band_src, band_c, gx_c, gy_c)
     # Beyond the frame, the nearest pixels at the image border are the right sources.
-    ext_o, src_o = nearest_extrapolate(disp_c, trusted_c, border, gx_c, gy_c)
+    ext_o, src_o = nearest_extrapolate(disp_c, sources, border, gx_c, gy_c)
     ext = np.where(band_c, ext_b, ext_o)
     src = np.where(band_c, src_b, src_o)
     ext = np.clip(ext, 0.5 * src, 2.0 * src)
@@ -161,6 +171,6 @@ def build_hidden_layer(image: np.ndarray, depth: np.ndarray, K: np.ndarray, sky:
     Kc[1, 2] += pad_y
     layer = HiddenLayer(rgb, hidden_depth.astype(np.float32), targets, band_c, border, inpaint_mask,
                         Kc, (pad_x, pad_y), E)
-    _log(f"{int(E.fg.sum())} edge px, hidden strip {int(band.sum())} px "
+    _log(f"{int(fg_edges.sum())} edge px, hidden strip {int(band.sum())} px "
          f"({100 * band.mean():.1f}% of image), border pad {pad_x}x{pad_y} px, inpainter {inpainter.name}")
     return layer

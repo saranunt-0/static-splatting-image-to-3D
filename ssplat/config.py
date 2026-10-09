@@ -34,9 +34,12 @@ class DepthConfig:
     dav2_onnx: str = ""
     # Shorter image side fed to Depth Anything (multiple of 14).
     dav2_input_size: int = 518
-    # Shift of the affine-invariant disparity as a fraction of its maximum (dav2 only).
-    # 0 assumes the predicted disparity is proportional to 1/depth.
-    dav2_disparity_shift: float = 0.0
+    # Depth Anything predicts affine-invariant disparity, normalised so the farthest point is ~0,
+    # i.e. infinitely far: unprojected as-is, the end of a corridor shoots off to "infinity".
+    # Adding offset x max(disparity) puts the farthest point at about 1/offset times the distance
+    # of the nearest one. 0.1 (about a 10:1 depth range) fits interiors: on 3 NYUv2 frames and
+    # the synthetic corridor it cut AbsRel from 0.36 (or divergent) to 0.04-0.13. Use 0 outdoors.
+    dav2_disparity_offset: float = 0.1
     # Horizontal field of view in degrees. 0 = from the model (MoGe), else from EXIF,
     # else default_fov_deg.
     fov_deg: float = 0.0
@@ -78,7 +81,10 @@ class OcclusionConfig:
     # A depth discontinuity is an occlusion edge if moving by max_baseline would open a
     # gap of at least this many pixels.
     edge_parallax_px: float = 1.0
-    # ...and if the far side is at least this much (relative) farther away.
+    # ...and if it is steeper than a continuous surface seen at this angle from its normal
+    # (88 deg: walls/floors/shelves seen almost edge-on stay closed; real jumps are far steeper).
+    edge_max_angle_deg: float = 88.0
+    # Hidden surfaces are placed at least this much (relative) behind their occluder.
     edge_min_ratio: float = 0.03
     # lama: LaMa (Apache-2.0, big-lama TorchScript, CPU OK). telea: OpenCV, no model.
     inpainter: str = "lama"
@@ -89,6 +95,9 @@ class OcclusionConfig:
     max_extent_frac: float = 0.15
     # Extra pixels added to the hidden-layer band.
     band_margin_px: int = 3
+    # Ignore occluding-edge fragments shorter than this (depth noise on cluttered objects);
+    # they would make speckles of inpainted background.
+    min_edge_px: int = 10
 
 
 @dataclass
