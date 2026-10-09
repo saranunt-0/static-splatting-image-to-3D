@@ -114,5 +114,123 @@ GPU is 1–2 orders of magnitude faster.
 
 ## 6. Experiments
 
-See §6 results below (synthetic corridor with exact ground truth, NYUv2 corridor with measured
-depth, two real corridor photos).
+Everything below ran on the development sandbox: **4 CPU cores, no GPU**. Hugging Face and the
+Apple CDN were blocked by the sandbox's network policy, so **MoGe-2 and SHARP could not be run
+with real weights here**. Their wiring was tested with randomly initialised weights. The
+monocular depth model used in these experiments is therefore the fallback, Depth Anything V2-Large
+(ONNX, from a GitHub release). Ground-truth or measured depth stands in for "good metric depth".
+
+### 6.1 Synthetic corridor (exact ground truth)
+
+`bench/synthetic_corridor.py` ray-traces a 2.5 m wide, 19 m long corridor at 512×384, 70° FoV:
+tiled floor, panel ceiling with lights, painted walls with posters, four recessed doors, a pillar,
+a cabinet, a hanging sign and an end window. The view from the reference camera is the "photo".
+Ten novel views are rendered exactly: sideways ±0.1/±0.2/+0.3 m, up/down 0.15 m, forward 0.5/1.0 m,
+and an orbit 0.25 m to the side looking back at the scene centre (median depth 3.1 m). Metrics
+are averaged over the ten views. *seen / unseen* split each view into pixels visible in the photo
+and pixels that are not (disoccluded or out of frame; 2–25 % of a view).
+
+| Depth | Variant | PSNR ↑ | SSIM ↑ | PSNR seen | PSNR unseen | coverage |
+|---|---|---|---|---|---|---|
+| ground truth | naive point cloud (isotropic splats) | 21.40 | 0.846 | 29.92 | 9.17 | 94.8 % |
+| ground truth | surfels (footprint Gaussians + edge cuts) | 21.34 | 0.872 | 31.63 | 8.77 | 94.6 % |
+| ground truth | surfels + train on the photo (original step 2) | 21.23 | 0.887 | **36.58** | 8.55 | 94.5 % |
+| ground truth | surfels + hidden layer | 29.68 | 0.921 | 31.58 | **21.30** | 99.98 % |
+| ground truth | **full** (hidden layer + refinement) | **31.95** | **0.937** | **36.62** | **21.45** | 99.98 % |
+| Depth Anything V2 | naive point cloud | 21.13 | 0.823 | 28.49 | 9.21 | 95.0 % |
+| Depth Anything V2 | surfels | 20.88 | 0.838 | 29.08 | 8.66 | 94.7 % |
+| Depth Anything V2 | surfels + train on the photo | 20.63 | 0.830 | 29.54 | 8.50 | 94.7 % |
+| Depth Anything V2 | surfels + hidden layer | 28.12 | **0.887** | 29.27 | 21.12 | 99.95 % |
+| Depth Anything V2 | **full** | **28.48** | 0.879 | **29.84** | **21.32** | 99.94 % |
+
+Depth Anything V2 here: AbsRel 0.043, δ1 0.9999 after median scaling, with the 0.1 offset prior
+(§6.2). Unseen pixels make up 1–13 % of a view, depending on the motion. Input-view PSNR after
+200 refinement steps: 55–61 dB (32–33 dB before). Run: `python -m bench.run_benchmark`.
+
+![synthetic corridor: rows = ground truth and the five variants; columns = 0.3 m sideways, 0.25 m orbit, 1 m forward](images/synthetic_compare_gt_depth.jpg)
+
+**What this says about the original design**
+1. **The hidden layer is the biggest single gain (+8.3 dB PSNR overall).** Without it, every
+   disoccluded or out-of-frame pixel is a hole (~9 dB PSNR there; ~21 dB with the layer + LaMa),
+   and full-image PSNR stays capped around 21 dB no matter how good the rest is.
+2. **"Train 3DGS on the one image" helps only where the photo saw the surface, and only if the
+   depth is right.** With exact depth it raises seen-region PSNR by +5 dB (31.6 → 36.6): the
+   per-pixel Gaussians slightly blur the photo and the refinement removes that. With estimated
+   depth the gain shrinks to +0.5 dB and SSIM is flat, because geometry error then dominates and
+   sharper colours on slightly wrong geometry do not look better. It is worth keeping (cheap, never
+   harmful here, large gain with good depth), but it is not the core of the method.
+3. **Depth quality sets the ceiling.** 0.043 AbsRel already costs 3.5 dB versus exact depth.
+   That is why the depth model choice (§3, §6.2) matters more than any 3DGS trick.
+4. Surfels vs isotropic points: same PSNR, clearly better SSIM (closed surfaces, no speckle at
+   grazing angles), and they make the refinement and the hidden layer work.
+
+### 6.2 Depth: why the depth model must give shape *and* camera
+
+Depth Anything V2-Large (relative disparity), each map scaled to the true median depth:
+
+| Scene | AbsRel / δ1, disparity used as-is | **+0.1 × max offset (default)** | oracle scale + shift |
+|---|---|---|---|
+| synthetic corridor | 0.219 / 0.863 | **0.041 / 1.000** | 0.039 / 1.000 |
+| NYUv2 #50 (basement corridor) | 0.362 / 0.678 (far end at 48 m; true 7.4 m) | **0.113 / 0.887** | 0.090 / 0.960 |
+| NYUv2 #0 (held out) | diverges (AbsRel 270) / 0.668 | **0.133 / 0.786** | — |
+| NYUv2 #100 (held out) | diverges (AbsRel 14 551) / 0.717 | **0.085 / 0.940** | — |
+
+* The network's *shape* is good: AbsRel 0.04–0.09 once the right affine map is known.
+* The unknown **disparity shift** dominates the error. Relative models normalise the farthest
+  point to disparity ≈ 0, so the end of a corridor shoots off towards infinity. Corridors are
+  the worst case, because they span a long depth range in one view.
+* A fixed offset of 0.1 × max disparity ("the far end is about 10× farther than the nearest
+  point") fixes most of it on interiors. It was chosen on two scenes and validated on two
+  held-out NYUv2 frames. It is a **prior, not a measurement**: use 0 outdoors.
+* MoGe-2 estimates scale, shift and FoV from the image itself. That is why it is the default; a
+  relative-depth model is only the fallback.
+
+### 6.3 Engineering findings that changed the design
+
+* **Flying pixels → streaks.** Snapping must be spatially coherent. A per-pixel near/far
+  decision produced dithered edges; deciding on the locally averaged disparity fixed it.
+* **"Zebra" stripes on steep surfaces.** A relative-jump edge threshold (3 %) is secretly a
+  grazing-angle test of ~86° at 500 px focal length. Near surfaces seen almost edge-on (a
+  shelf top) were cut into fronto-parallel disks that separate when the camera moves, letting
+  the background show through in stripes. The explicit 88° grazing-angle criterion keeps them
+  closed. Novel-view holes on the NYU corridor dropped to 0.4–0.5 % of pixels.
+* **Hidden depth must extrapolate the far side only.** Taking the nearest "background" pixel
+  sometimes picked the occluder's own interior and bent the hidden surface forwards. Fixed by
+  restricting sources to pixels behind nearby edges, and by mask-aware slope estimation
+  (both caught by `tests/test_geometry.py`).
+
+### 6.4 Real corridors
+
+Three public photos (fetched by `bench/real_corridors.sh`; not redistributed here). All were
+run on CPU with Depth Anything V2 + the 0.1 prior, because MoGe-2 could not be downloaded in the
+sandbox. Settings: 640 px, 200 refinement steps, `max_baseline` 0.08. Preview motion is ±6 % of
+the median depth.
+
+| Photo | Notes | Gaussians (visible + hidden) | Input-view PSNR before → after | Observations |
+|---|---|---|---|---|
+| Subway platform (640×480, no EXIF, 60° assumed) | long vanishing perspective | 307 k + 294 k | 23.9 → 48.1 dB | Convincing parallax along the platform. Train and signage occlude correctly. Some blocky LaMa patches on the floor beside the bench. |
+| NYUv2 #50 basement corridor (560×426, calibrated 56.7°) | cluttered: pipes, shelves, crates | 239 k + 231 k | 29.4 → 57.6 dB | Holes in novel views 0.4–0.5 % of pixels. Faint foreground "ghosting" in some inpainted strips. |
+| same, with measured Kinect depth | stand-in for good metric depth | 239 k + 235 k | 30.5 → 52.5 dB | Truer parallax down the corridor. Kinect edge noise and RGB-D misalignment leave streaks at the shelf. |
+| House hallway (1280×720 video frame at 640×360, 60° assumed) | doorways off a hallway | 230 k + 258 k | 30.5 → 57.2 dB | The open bedroom door reveals the room behind it with correct parallax; the wall continues behind the door frame. **Fails at the overexposed glass sidelights**: monocular depth for glass is unreliable, and dark gaps open there when the camera moves. |
+
+Time per photo on 4 CPU cores (2 threads per run): 16–21 min, of which refinement is ~12 min and
+video rendering ~4 min. GPU time was not measured.
+
+
+## 7. Limitations and next steps
+
+* **Validate MoGe-2 (and compare SHARP) on Colab.** Neither could run with real weights here. The
+  notebook has a one-click SHARP comparison on the same photo.
+* **Inpainting quality** is the weakest link: LaMa is good at walls, floors and tiles, but on
+  complex objects it can "ghost" foreground texture into the hidden layer. Upgrade path: a
+  diffusion inpainter (e.g. SDXL/FLUX-Fill) for the hidden layer on GPU, or RGB-D inpainting.
+* **Larger motion** (walking down the corridor) needs generated views: e.g. render the scene
+  along a path, fill the holes with a camera-controlled video model (GEN3C / Stable Virtual Camera
+  / Lyra), then continue training the same Gaussians on those views. This repo's renderer and
+  refinement are a natural base for that.
+* **Glass, windows, mirrors and overexposed areas** get unreliable monocular depth and break first
+  (hallway sidelights). Masking them, or forcing them onto the wall plane, is a cheap next step.
+* **View-dependent effects** (glossy floors, glass) cannot be inferred from one photo. The export
+  is flat-colour (SH degree 0).
+* Metrics are PSNR/SSIM. LPIPS weights could not be downloaded in the sandbox. One synthetic
+  scene is not a benchmark; it is a controlled test that isolates each component.

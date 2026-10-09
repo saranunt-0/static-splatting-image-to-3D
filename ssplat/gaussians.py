@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from typing import Dict
+from typing import TYPE_CHECKING, Dict
 
 import numpy as np
 
 from .splats import Splats
+
+if TYPE_CHECKING:  # pragma: no cover
+    import torch
 
 SH_C0 = 0.28209479177387814
 

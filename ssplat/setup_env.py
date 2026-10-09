@@ -18,7 +18,6 @@ import subprocess
 import sys
 import tarfile
 import urllib.request
-from pathlib import Path
 
 from .export import NODE_DIR, SPLAT_TRANSFORM_VERSION
 
